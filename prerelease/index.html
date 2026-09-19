@@ -1096,8 +1096,8 @@ const GEMINI_RETRYABLE_STATUS = new Set([503, 429]);
 // Flash-Lite is a smaller, separate model with its own backend capacity, so
 // it's a reasonable free fallback when Flash itself is the thing that's
 // overloaded — still within the same API key's free tier, no extra setup.
-const GEMINI_PRIMARY_MODEL = 'gemini-flash-latest';
-const GEMINI_FALLBACK_MODEL = 'gemini-flash-lite-latest';
+const GEMINI_PRIMARY_MODEL = 'gemini-3.5-flash-lite';
+const GEMINI_FALLBACK_MODEL = 'gemini-3.5-flash';
 // A request that's merely slow (weak mobile connection, not an actual error
 // from Google) previously had nothing to make it give up — it could hang
 // indefinitely with no fallback ever triggering, since the retry loop below
@@ -1130,7 +1130,14 @@ async function callGeminiOnce(prompt, model, timeoutMs){
       {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({contents: [{parts: [{text: prompt}]}]}),
+        body: JSON.stringify({
+          contents: [{parts: [{text: prompt}]}],
+          generationConfig: {
+            thinkingConfig: {
+              thinkingLevel: 'minimal'
+            }
+          }
+        }),
         ...(GEMINI_TIMEOUT_ENABLED ? {signal: AbortSignal.timeout(timeoutMs)} : {})
       }
     );
@@ -4169,31 +4176,59 @@ async function runBulkAiGrade(btn){
   // clicked individually while the batch is in flight
   document.querySelectorAll('.ai-grade-btn').forEach(b=>{ b.disabled = true; b.textContent = '⏳ Bewertung läuft…'; });
 
-  // A 429 already seen during the live exam means this key's quota is
-  // genuinely under pressure — space bulk requests out much more (2s
-  // instead of 250ms) rather than repeating the density that likely
-  // caused it, and widen each request's own retry backoff to match (see
-  // callGeminiApi's slowMode).
+  // Fast bulk grading: process several independent open answers in parallel.
+  // If this session has already hit a 429, fall back automatically to one
+  // request at a time with a small gap so the quota can recover.
   const slowMode = mySession.examRateLimitSeen;
-  const gapMs = slowMode ? 2000 : 250;
-  // Proxies the existing aiGradingCancelRequested flag (set by the click
-  // handler above) rather than a separate flag, so callGeminiApi's retry
-  // backoff — now up to 12-108s — can interrupt itself immediately on
-  // cancel instead of always sitting through the full wait before the loop
-  // gets a chance to check again.
+  const concurrency = slowMode ? 1 : 4;
+  const gapMs = slowMode ? 2000 : 0;
+
+  // Proxies the existing aiGradingCancelRequested flag so every worker and
+  // callGeminiApi retry/backoff can stop promptly when the user cancels.
   const cancelToken = {get cancelled(){ return mySession.aiGradingCancelRequested; }};
-  try{
-    for(let i=0;i<openQs.length;i++){
+  let nextIndex = 0;
+  let completed = 0;
+
+  const worker = async () => {
+    while(true){
       if(session !== mySession) return; // a new exam was started meanwhile — abort silently
-      if(mySession.aiGradingCancelRequested) break;
+      if(mySession.aiGradingCancelRequested) return;
+
+      const i = nextIndex++;
+      if(i >= openQs.length) return;
+
       const q = openQs[i];
-      if(mySession.selfGrade.get(q.id) !== undefined) continue; // graded by something else in the meantime
-      const progressPrefix = `⏳ Bewertung abbrechen (${i+1}/${openQs.length})`;
-      if(btn) btn.textContent = progressPrefix;
-      const onStatus = (msg) => { if(btn) btn.textContent = `${progressPrefix} – ${msg}`; };
-      await runAiGradeQuestion(mySession, q, GEMINI_TIMEOUT_RESULTS_MS, {slowMode, onStatus, cancelToken});
-      if(i < openQs.length-1) await new Promise(r=>setTimeout(r, gapMs));
+      if(mySession.selfGrade.get(q.id) !== undefined){
+        completed++;
+        continue; // graded by something else in the meantime
+      }
+
+      const onStatus = (msg) => {
+        if(btn) btn.textContent = `⏳ Bewertung abbrechen (${completed}/${openQs.length}) – ${msg}`;
+      };
+
+      await runAiGradeQuestion(
+        mySession,
+        q,
+        GEMINI_TIMEOUT_RESULTS_MS,
+        {slowMode, onStatus, cancelToken}
+      );
+
+      completed++;
+      if(btn) btn.textContent = `⏳ Bewertung abbrechen (${completed}/${openQs.length})`;
+
+      if(gapMs && completed < openQs.length){
+        await new Promise(r=>setTimeout(r, gapMs));
+      }
     }
+  };
+
+  try{
+    const workers = Array.from(
+      {length: Math.min(concurrency, openQs.length)},
+      () => worker()
+    );
+    await Promise.all(workers);
   } finally {
     mySession.aiGradingRunning = false;
   }
